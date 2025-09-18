@@ -188,8 +188,7 @@ class Kosmos25QuantizationTester:
             self.model = Kosmos2_5ForConditionalGeneration.from_pretrained(
                 self.model_name,
                 quantization_config=quantization_config,
-                device_map="auto",
-                torch_dtype=torch.float16
+                device_map="auto"
             )
             
             load_time = time.time() - start_time

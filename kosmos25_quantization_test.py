@@ -17,7 +17,12 @@ from transformers import (
     Kosmos2_5ForConditionalGeneration,
     BitsAndBytesConfig
 )
-import GPUtil
+try:
+    import GPUtil
+    GPUTIL_AVAILABLE = True
+except ImportError:
+    GPUTIL_AVAILABLE = False
+    print("Warning: GPUtil not available, GPU monitoring will be limited")
 from typing import Dict, List, Tuple, Optional
 
 class MemoryMonitor:
@@ -43,13 +48,14 @@ class MemoryMonitor:
             
             # Additional GPU info using GPUtil
             try:
-                gpus = GPUtil.getGPUs()
-                if gpus:
-                    gpu = gpus[0]
-                    memory_info['gpu_total_gb'] = gpu.memoryTotal / 1024
-                    memory_info['gpu_used_gb'] = gpu.memoryUsed / 1024
-                    memory_info['gpu_free_gb'] = gpu.memoryFree / 1024
-                    memory_info['gpu_utilization_percent'] = gpu.load * 100
+                if GPUTIL_AVAILABLE:
+                    gpus = GPUtil.getGPUs()
+                    if gpus:
+                        gpu = gpus[0]
+                        memory_info['gpu_total_gb'] = gpu.memoryTotal / 1024
+                        memory_info['gpu_used_gb'] = gpu.memoryUsed / 1024
+                        memory_info['gpu_free_gb'] = gpu.memoryFree / 1024
+                        memory_info['gpu_utilization_percent'] = gpu.load * 100
             except:
                 pass
         
@@ -132,7 +138,6 @@ class Kosmos25QuantTester:
                 self.model_name,
                 quantization_config=quantization_config,
                 device_map="auto",
-                torch_dtype=torch.float16,
             )
             
             load_time = time.time() - start_time

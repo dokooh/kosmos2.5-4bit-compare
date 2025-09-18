@@ -130,7 +130,6 @@ def test_quantization_strategy(model_name, strategy, config, image_path, task_ty
                 model_name,
                 quantization_config=config,
                 device_map="auto",
-                torch_dtype=torch.float16,
                 trust_remote_code=True
             )
             # Apply dtype fixes for quantized models
