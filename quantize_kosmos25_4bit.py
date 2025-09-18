@@ -16,7 +16,12 @@ from pathlib import Path
 
 import torch
 import psutil
-import GPUtil
+try:
+    import GPUtil
+    GPUTIL_AVAILABLE = True
+except ImportError:
+    GPUTIL_AVAILABLE = False
+    print("Warning: GPUtil not available, GPU monitoring will be limited")
 from transformers import (
     Kosmos2_5ForConditionalGeneration,
     Kosmos2_5Processor,
@@ -50,14 +55,15 @@ class MemoryMonitor:
         
         if self.has_gpu:
             try:
-                gpus = GPUtil.getGPUs()
-                if gpus:
-                    gpu = gpus[0]
-                    memory_info.update({
-                        'gpu_used_gb': gpu.memoryUsed / 1024,
-                        'gpu_total_gb': gpu.memoryTotal / 1024,
-                        'gpu_percent': (gpu.memoryUsed / gpu.memoryTotal) * 100
-                    })
+                if GPUTIL_AVAILABLE:
+                    gpus = GPUtil.getGPUs()
+                    if gpus:
+                        gpu = gpus[0]
+                        memory_info.update({
+                            'gpu_used_gb': gpu.memoryUsed / 1024,
+                            'gpu_total_gb': gpu.memoryTotal / 1024,
+                            'gpu_percent': (gpu.memoryUsed / gpu.memoryTotal) * 100
+                        })
             except:
                 pass
                 
@@ -133,7 +139,6 @@ class Kosmos25Quantizer:
             model = Kosmos2_5ForConditionalGeneration.from_pretrained(
                 self.model_name,
                 quantization_config=config,
-                torch_dtype=torch.float16,
                 device_map="auto",
                 trust_remote_code=True
             )

@@ -16,7 +16,12 @@ from pathlib import Path
 
 import torch
 import psutil
-import GPUtil
+try:
+    import GPUtil
+    GPUTIL_AVAILABLE = True
+except ImportError:
+    GPUTIL_AVAILABLE = False
+    print("Warning: GPUtil not available, GPU monitoring will be limited")
 from PIL import Image
 from transformers import (
     Kosmos2_5ForConditionalGeneration,
@@ -49,21 +54,22 @@ class MemoryMonitor:
         
         if self.has_gpu:
             try:
-                gpus = GPUtil.getGPUs()
-                if gpus:
-                    gpu = gpus[0]
-                    memory_info.update({
-                        'gpu_used_gb': gpu.memoryUsed / 1024,
-                        'gpu_total_gb': gpu.memoryTotal / 1024,
-                        'gpu_percent': (gpu.memoryUsed / gpu.memoryTotal) * 100
-                    })
-                    
-                    # Add PyTorch CUDA memory info
-                    if torch.cuda.is_available():
+                if GPUTIL_AVAILABLE:
+                    gpus = GPUtil.getGPUs()
+                    if gpus:
+                        gpu = gpus[0]
                         memory_info.update({
-                            'torch_allocated_gb': torch.cuda.memory_allocated() / (1024**3),
-                            'torch_reserved_gb': torch.cuda.memory_reserved() / (1024**3)
+                            'gpu_used_gb': gpu.memoryUsed / 1024,
+                            'gpu_total_gb': gpu.memoryTotal / 1024,
+                            'gpu_percent': (gpu.memoryUsed / gpu.memoryTotal) * 100
                         })
+                
+                # Add PyTorch CUDA memory info (this doesn't require GPUtil)
+                if torch.cuda.is_available():
+                    memory_info.update({
+                        'torch_allocated_gb': torch.cuda.memory_allocated() / (1024**3),
+                        'torch_reserved_gb': torch.cuda.memory_reserved() / (1024**3)
+                    })
             except Exception as e:
                 logger.warning(f"[DEBUG] ⚠️ Could not get GPU info: {e}")
                 
@@ -90,10 +96,20 @@ class Kosmos25Inferencer:
             
             # Check if quantization metadata exists
             metadata_path = self.model_path / "quantization_metadata.json"
+            is_quantized = False
             if metadata_path.exists():
                 with open(metadata_path, "r") as f:
                     metadata = json.load(f)
+                is_quantized = True
                 logger.info(f"[DEBUG] 📋 Found quantization metadata: {metadata.get('quantization_type', 'unknown')}")
+            
+            # Also check for quantization info file
+            info_path = self.model_path / "quantization_info.txt"
+            if info_path.exists():
+                is_quantized = True
+                logger.info(f"[DEBUG] 📋 Found quantization info file")
+                
+            logger.info(f"[DEBUG] 🔍 Model appears to be quantized: {is_quantized}")
             
             # Memory before loading
             mem_before = self.monitor.get_memory_info()
@@ -109,32 +125,51 @@ class Kosmos25Inferencer:
             # Load model with careful dtype handling
             logger.info(f"[DEBUG] 🔄 Loading model...")
             
-            # Try different loading strategies
-            load_strategies = [
-                {
-                    "name": "default_quantized",
-                    "kwargs": {
-                        "device_map": "auto",
-                        "trust_remote_code": True,
-                        "torch_dtype": torch.float16
+            # Try different loading strategies based on model type
+            if is_quantized:
+                # For quantized models, avoid torch_dtype to prevent casting errors
+                load_strategies = [
+                    {
+                        "name": "quantized_auto",
+                        "kwargs": {
+                            "device_map": "auto",
+                            "trust_remote_code": True
+                        }
+                    },
+                    {
+                        "name": "quantized_explicit_device",
+                        "kwargs": {
+                            "device_map": {"": self.device},
+                            "trust_remote_code": True
+                        }
+                    },
+                    {
+                        "name": "quantized_cpu_fallback",
+                        "kwargs": {
+                            "device_map": "cpu",
+                            "trust_remote_code": True
+                        }
                     }
-                },
-                {
-                    "name": "explicit_device",
-                    "kwargs": {
-                        "device_map": {"": self.device},
-                        "trust_remote_code": True,
-                        "torch_dtype": torch.float16
+                ]
+            else:
+                # For non-quantized models, try with explicit dtype
+                load_strategies = [
+                    {
+                        "name": "standard_float16",
+                        "kwargs": {
+                            "device_map": "auto",
+                            "trust_remote_code": True,
+                            "torch_dtype": torch.float16
+                        }
+                    },
+                    {
+                        "name": "standard_auto_dtype",
+                        "kwargs": {
+                            "device_map": "auto",
+                            "trust_remote_code": True
+                        }
                     }
-                },
-                {
-                    "name": "no_dtype",
-                    "kwargs": {
-                        "device_map": "auto",
-                        "trust_remote_code": True
-                    }
-                }
-            ]
+                ]
             
             for strategy in load_strategies:
                 try:

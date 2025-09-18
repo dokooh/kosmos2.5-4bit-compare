@@ -102,7 +102,6 @@ def quantize_and_save_model(model_name, strategy, output_dir):
             model_name,
             quantization_config=quantization_config,
             device_map="auto",
-            torch_dtype=torch.float16,
             trust_remote_code=True
         )
         
