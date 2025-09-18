@@ -1,388 +1,327 @@
 #!/usr/bin/env python3
 """
-OCR Inference Script for Kosmos-2.5 Model
-Performs OCR/Markdown task on images using locally saved quantized models.
+OCR Inference Script for Kosmos-2.5
+Tests quantized models on OCR/Markdown tasks with proper dtype handling.
 """
 
+import argparse
 import os
 import sys
-import json
 import time
-import argparse
-import traceback
-from pathlib import Path
-from typing import Dict, Any, Optional, List
-
 import torch
+import gc
 import psutil
-import GPUtil
+import json
+from pathlib import Path
 from PIL import Image
-from transformers import AutoProcessor, Kosmos2_5ForConditionalGeneration
+from transformers import (
+    Kosmos2_5ForConditionalGeneration, 
+    Kosmos2_5Processor,
+    BitsAndBytesConfig
+)
 
-print(f"[DEBUG] Inference script started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-print(f"[DEBUG] Python version: {sys.version}")
-print(f"[DEBUG] PyTorch version: {torch.__version__}")
-print(f"[DEBUG] CUDA available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"[DEBUG] CUDA version: {torch.version.cuda}")
-    print(f"[DEBUG] GPU count: {torch.cuda.device_count()}")
-
-def get_memory_usage() -> Dict[str, float]:
+def get_memory_usage():
     """Get current GPU and RAM memory usage"""
-    print("[DEBUG] Getting memory usage...")
+    process = psutil.Process(os.getpid())
+    ram_mb = process.memory_info().rss / 1024 / 1024
     
-    memory_info = {
-        'ram_used_gb': psutil.virtual_memory().used / (1024**3),
-        'ram_total_gb': psutil.virtual_memory().total / (1024**3),
-        'ram_percent': psutil.virtual_memory().percent
-    }
+    gpu_mb = 0
+    if torch.cuda.is_available():
+        gpu_mb = torch.cuda.memory_allocated() / 1024 / 1024
     
-    try:
-        if torch.cuda.is_available():
-            gpus = GPUtil.getGPUs()
-            if gpus:
-                gpu = gpus[0]  # Use first GPU
-                memory_info.update({
-                    'gpu_used_mb': gpu.memoryUsed,
-                    'gpu_total_mb': gpu.memoryTotal,
-                    'gpu_percent': (gpu.memoryUsed / gpu.memoryTotal) * 100
-                })
-                print(f"[DEBUG] GPU memory: {gpu.memoryUsed}MB / {gpu.memoryTotal}MB ({memory_info['gpu_percent']:.1f}%)")
-        
-        # Also try torch memory stats
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / (1024**2)  # MB
-            cached = torch.cuda.memory_reserved() / (1024**2)  # MB
-            memory_info.update({
-                'torch_allocated_mb': allocated,
-                'torch_cached_mb': cached
-            })
-            print(f"[DEBUG] Torch GPU memory - Allocated: {allocated:.1f}MB, Cached: {cached:.1f}MB")
-            
-    except Exception as e:
-        print(f"[DEBUG] Error getting GPU memory: {e}")
-        
-    print(f"[DEBUG] RAM usage: {memory_info['ram_used_gb']:.1f}GB / {memory_info['ram_total_gb']:.1f}GB ({memory_info['ram_percent']:.1f}%)")
-    return memory_info
+    return ram_mb, gpu_mb
 
-def load_and_preprocess_image(image_path: str) -> Optional[Image.Image]:
-    """Load and preprocess image for OCR"""
-    print(f"[DEBUG] Loading image from: {image_path}")
-    
-    try:
-        image = Image.open(image_path)
-        print(f"[DEBUG] Image loaded - Size: {image.size}, Mode: {image.mode}")
-        
-        # Convert to RGB if necessary
-        if image.mode != 'RGB':
-            print(f"[DEBUG] Converting image from {image.mode} to RGB")
-            image = image.convert('RGB')
-        
-        print(f"[DEBUG] Final image - Size: {image.size}, Mode: {image.mode}")
-        return image
-        
-    except Exception as e:
-        print(f"[ERROR] Error loading image: {str(e)}")
-        print(f"[ERROR] Traceback: {traceback.format_exc()}")
-        return None
+def print_debug(message, level="INFO"):
+    """Print debug message with timestamp"""
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] [{level}] {message}")
+    sys.stdout.flush()
 
-def perform_ocr_inference(model_path: str, image_path: str, task: str = "ocr") -> Dict[str, Any]:
-    """Perform OCR inference using the quantized model"""
-    print(f"\n[DEBUG] ========== Starting OCR inference ==========")
-    print(f"[DEBUG] Model path: {model_path}")
-    print(f"[DEBUG] Image path: {image_path}")
-    print(f"[DEBUG] Task: {task}")
+def fix_model_dtypes(model):
+    """Fix dtype mismatches in the model - crucial for 4-bit quantized models"""
+    print_debug("Fixing model dtypes to prevent bias dtype errors...")
     
-    start_time = time.time()
+    def fix_layer_dtypes(module, target_dtype=torch.float16):
+        """Recursively fix dtypes in model layers"""
+        for name, param in module.named_parameters(recurse=False):
+            if param.dtype != target_dtype and param.dtype != torch.int8 and param.dtype != torch.uint8:
+                print_debug(f"Converting {name} from {param.dtype} to {target_dtype}")
+                param.data = param.data.to(target_dtype)
+        
+        for name, buffer in module.named_buffers(recurse=False):
+            if buffer is not None and buffer.dtype != target_dtype and buffer.dtype != torch.int8 and buffer.dtype != torch.uint8:
+                print_debug(f"Converting buffer {name} from {buffer.dtype} to {target_dtype}")
+                buffer.data = buffer.data.to(target_dtype)
+        
+        # Recursively process child modules
+        for child_module in module.children():
+            fix_layer_dtypes(child_module, target_dtype)
+    
+    # Fix dtypes in the entire model
+    fix_layer_dtypes(model, torch.float16)
+    
+    # Ensure model is in the right dtype
+    model = model.to(torch.float16)
+    
+    print_debug("Model dtype fixes applied")
+    return model
+
+def load_model_and_processor(model_path, is_quantized=False):
+    """Load model and processor with proper error handling"""
+    print_debug(f"Loading model from: {model_path}")
+    print_debug(f"Is quantized: {is_quantized}")
     
     try:
-        # Clear GPU cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            print("[DEBUG] Cleared GPU cache")
-        
-        # Get initial memory usage
-        print("[DEBUG] Getting initial memory usage...")
-        initial_memory = get_memory_usage()
-        
-        # Load image
-        print("[DEBUG] Loading and preprocessing image...")
-        image = load_and_preprocess_image(image_path)
-        if image is None:
-            raise ValueError("Failed to load image")
-        
         # Load processor
-        print("[DEBUG] Loading processor...")
-        processor = AutoProcessor.from_pretrained(model_path)
-        print("[DEBUG] Processor loaded successfully")
+        print_debug("Loading processor...")
+        processor = Kosmos2_5Processor.from_pretrained(model_path)
         
-        # Load model
-        print("[DEBUG] Loading quantized model...")
-        model = Kosmos2_5ForConditionalGeneration.from_pretrained(
-            model_path,
-            device_map="auto",
-            torch_dtype=torch.float16
-        )
-        print("[DEBUG] Model loaded successfully")
+        # Load model with appropriate settings
+        print_debug("Loading model...")
+        if is_quantized:
+            # For pre-quantized models, load without quantization config
+            model = Kosmos2_5ForConditionalGeneration.from_pretrained(
+                model_path,
+                device_map="auto",
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
+            )
+        else:
+            # For original model
+            model = Kosmos2_5ForConditionalGeneration.from_pretrained(
+                model_path,
+                device_map="auto",
+                torch_dtype=torch.float16,
+                trust_remote_code=True
+            )
         
-        # Get memory usage after loading
-        print("[DEBUG] Getting memory usage after model loading...")
-        loaded_memory = get_memory_usage()
+        # Apply dtype fixes to prevent bias errors
+        model = fix_model_dtypes(model)
         
-        # Prepare prompt based on task
-        task_prompts = {
-            "ocr": "<ocr>",  # Standard OCR task
-            "markdown": "<md>",  # Markdown conversion task
-            "text_detection": "<detect>",  # Text detection
-            "caption": "<cap>",  # Image captioning
-        }
+        # Set model to eval mode
+        model.eval()
         
-        prompt = task_prompts.get(task, "<ocr>")
-        print(f"[DEBUG] Using prompt: {prompt}")
+        print_debug("Model and processor loaded successfully")
+        return model, processor
+        
+    except Exception as e:
+        print_debug(f"Error loading model: {str(e)}", "ERROR")
+        raise
+
+def perform_ocr_inference(model, processor, image_path, task_type="markdown"):
+    """Perform OCR inference on the provided image"""
+    print_debug(f"Starting OCR inference on: {image_path}")
+    print_debug(f"Task type: {task_type}")
+    
+    try:
+        # Load and process image
+        print_debug("Loading image...")
+        image = Image.open(image_path).convert('RGB')
+        print_debug(f"Image size: {image.size}")
+        
+        # Prepare prompts based on task type
+        if task_type.lower() == "markdown":
+            prompt = "<md>"
+            print_debug("Using Markdown extraction prompt")
+        else:  # OCR
+            prompt = "<ocr>"
+            print_debug("Using OCR prompt")
         
         # Process inputs
-        print("[DEBUG] Processing inputs...")
+        print_debug("Processing inputs...")
         inputs = processor(
-            text=prompt,
-            images=image,
+            images=image, 
+            text=prompt, 
             return_tensors="pt"
         )
-        print(f"[DEBUG] Input keys: {list(inputs.keys())}")
-        print(f"[DEBUG] Input shapes: {{k: v.shape if hasattr(v, 'shape') else type(v) for k, v in inputs.items()}}")
         
-        # Move inputs to appropriate device
-        if torch.cuda.is_available():
-            device = next(model.parameters()).device
-            print(f"[DEBUG] Moving inputs to device: {device}")
-            inputs = {k: v.to(device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+        # Move inputs to the same device as model
+        device = next(model.parameters()).device
+        print_debug(f"Moving inputs to device: {device}")
+        inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         
-        # Generate
-        print("[DEBUG] Starting generation...")
-        generation_start = time.time()
+        # Get memory usage before inference
+        ram_before, gpu_before = get_memory_usage()
+        print_debug(f"Memory before inference - RAM: {ram_before:.1f}MB, GPU: {gpu_before:.1f}MB")
+        
+        # Perform inference
+        print_debug("Starting model generation...")
+        start_time = time.time()
         
         with torch.no_grad():
+            # Use more conservative generation parameters to avoid errors
             generated_ids = model.generate(
                 **inputs,
-                max_new_tokens=2048,
-                do_sample=False,
+                max_new_tokens=512,
+                do_sample=False,  # Use greedy decoding for stability
+                temperature=None,
+                top_p=None,
+                num_beams=1,
+                early_stopping=True,
                 pad_token_id=processor.tokenizer.pad_token_id,
                 eos_token_id=processor.tokenizer.eos_token_id,
                 use_cache=True
             )
         
-        generation_time = time.time() - generation_start
-        print(f"[DEBUG] Generation completed in {generation_time:.2f} seconds")
-        print(f"[DEBUG] Generated IDs shape: {generated_ids.shape}")
+        inference_time = time.time() - start_time
+        print_debug(f"Inference completed in {inference_time:.2f} seconds")
         
-        # Decode output
-        print("[DEBUG] Decoding generated text...")
-        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        # Get memory usage after inference
+        ram_after, gpu_after = get_memory_usage()
+        print_debug(f"Memory after inference - RAM: {ram_after:.1f}MB, GPU: {gpu_after:.1f}MB")
         
-        # Clean up the output (remove the input prompt)
+        # Decode results
+        print_debug("Decoding generated text...")
+        generated_text = processor.batch_decode(
+            generated_ids, 
+            skip_special_tokens=True
+        )[0]
+        
+        # Extract the generated content (remove the prompt)
         if prompt in generated_text:
-            generated_text = generated_text.replace(prompt, "", 1).strip()
-            print("[DEBUG] Removed prompt from generated text")
+            result_text = generated_text.split(prompt, 1)[1].strip()
+        else:
+            result_text = generated_text.strip()
         
-        print(f"[DEBUG] Generated text length: {len(generated_text)} characters")
-        print(f"[DEBUG] Generated text preview: {generated_text[:200]}...")
+        print_debug("OCR inference completed successfully")
         
-        # Get final memory usage
-        print("[DEBUG] Getting final memory usage...")
-        final_memory = get_memory_usage()
-        
-        # Calculate memory differences
-        ram_diff = loaded_memory['ram_used_gb'] - initial_memory['ram_used_gb']
-        gpu_diff = 0
-        if 'gpu_used_mb' in loaded_memory and 'gpu_used_mb' in initial_memory:
-            gpu_diff = loaded_memory['gpu_used_mb'] - initial_memory['gpu_used_mb']
-        
-        end_time = time.time()
-        total_time = end_time - start_time
-        
-        result = {
+        return {
             'success': True,
-            'model_path': model_path,
-            'image_path': image_path,
-            'task': task,
-            'prompt': prompt,
-            'generated_text': generated_text,
-            'text_length': len(generated_text),
-            'timing': {
-                'total_time_seconds': total_time,
-                'generation_time_seconds': generation_time,
-                'loading_time_seconds': total_time - generation_time
-            },
-            'memory_usage': {
-                'initial': initial_memory,
-                'loaded': loaded_memory,
-                'final': final_memory,
-                'ram_increase_gb': ram_diff,
-                'gpu_increase_mb': gpu_diff
-            },
-            'image_info': {
-                'size': image.size,
-                'mode': image.mode
-            }
+            'generated_text': result_text,
+            'inference_time': inference_time,
+            'ram_usage': ram_after - ram_before,
+            'gpu_usage': gpu_after - gpu_before,
+            'error': None
         }
-        
-        print(f"[DEBUG] Inference completed successfully in {total_time:.2f} seconds")
-        print(f"[DEBUG] Generation took {generation_time:.2f} seconds")
-        print(f"[DEBUG] Generated {len(generated_text)} characters")
-        
-        # Clear memory
-        del model, processor, inputs, generated_ids
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        print("[DEBUG] Cleared models from memory")
-        
-        return result
         
     except Exception as e:
-        print(f"[ERROR] Error during inference: {str(e)}")
-        print(f"[ERROR] Traceback: {traceback.format_exc()}")
+        print_debug(f"Error during inference: {str(e)}", "ERROR")
+        import traceback
+        print_debug(f"Traceback: {traceback.format_exc()}", "ERROR")
         
-        end_time = time.time()
         return {
             'success': False,
-            'model_path': model_path,
-            'image_path': image_path,
-            'task': task,
-            'error': str(e),
-            'total_time_seconds': end_time - start_time,
-            'traceback': traceback.format_exc()
+            'generated_text': None,
+            'inference_time': 0,
+            'ram_usage': 0,
+            'gpu_usage': 0,
+            'error': str(e)
         }
 
-def find_quantized_models(base_dir: str) -> List[str]:
-    """Find all quantized model directories"""
-    print(f"[DEBUG] Searching for quantized models in: {base_dir}")
-    
-    base_path = Path(base_dir)
-    if not base_path.exists():
-        print(f"[ERROR] Base directory does not exist: {base_dir}")
-        return []
-    
-    model_dirs = []
-    for item in base_path.iterdir():
-        if item.is_dir() and item.name.startswith('kosmos25_'):
-            # Check if it contains model files
-            config_file = item / 'config.json'
-            if config_file.exists():
-                model_dirs.append(str(item))
-                print(f"[DEBUG] Found quantized model: {item.name}")
-    
-    print(f"[DEBUG] Found {len(model_dirs)} quantized models")
-    return sorted(model_dirs)
-
 def main():
-    parser = argparse.ArgumentParser(description='Perform OCR inference with quantized Kosmos-2.5 models')
-    parser.add_argument('--model-path', '-m', type=str, required=True,
-                        help='Path to the quantized model directory or base directory containing multiple models')
-    parser.add_argument('--image-path', '-i', type=str, required=True,
-                        help='Path to the input image')
-    parser.add_argument('--output-file', '-o', type=str, default='ocr_results.json',
-                        help='File to save results (default: ocr_results.json)')
-    parser.add_argument('--task', '-t', type=str, choices=['ocr', 'markdown', 'text_detection', 'caption'],
-                        default='ocr', help='Task to perform (default: ocr)')
-    parser.add_argument('--test-all-models', action='store_true',
-                        help='Test all quantized models found in the base directory')
+    parser = argparse.ArgumentParser(description="OCR inference with Kosmos-2.5")
+    parser.add_argument("--model_path", required=True,
+                       help="Path to model (original or quantized)")
+    parser.add_argument("--image_path", required=True,
+                       help="Path to input image")
+    parser.add_argument("--output_file", required=True,
+                       help="Path to save results")
+    parser.add_argument("--task_type", choices=['ocr', 'markdown'], default='markdown',
+                       help="Type of task to perform")
+    parser.add_argument("--is_quantized", action='store_true',
+                       help="Whether the model is pre-quantized")
     
     args = parser.parse_args()
     
-    print(f"[DEBUG] Arguments parsed:")
-    print(f"[DEBUG] - Model path: {args.model_path}")
-    print(f"[DEBUG] - Image path: {args.image_path}")
-    print(f"[DEBUG] - Output file: {args.output_file}")
-    print(f"[DEBUG] - Task: {args.task}")
-    print(f"[DEBUG] - Test all models: {args.test_all_models}")
+    print_debug("=== Kosmos-2.5 OCR Inference ===")
+    print_debug(f"Model path: {args.model_path}")
+    print_debug(f"Image path: {args.image_path}")
+    print_debug(f"Output file: {args.output_file}")
+    print_debug(f"Task type: {args.task_type}")
+    print_debug(f"Is quantized: {args.is_quantized}")
     
-    # Check if image exists
-    if not Path(args.image_path).exists():
-        print(f"[ERROR] Image file does not exist: {args.image_path}")
-        sys.exit(1)
+    # Check inputs
+    if not os.path.exists(args.model_path):
+        print_debug(f"Model path does not exist: {args.model_path}", "ERROR")
+        return 1
     
-    # Determine models to test
-    models_to_test = []
+    if not os.path.exists(args.image_path):
+        print_debug(f"Image path does not exist: {args.image_path}", "ERROR")
+        return 1
     
-    if args.test_all_models:
-        print("[DEBUG] Searching for all quantized models...")
-        models_to_test = find_quantized_models(args.model_path)
-        if not models_to_test:
-            print(f"[ERROR] No quantized models found in: {args.model_path}")
-            sys.exit(1)
+    # Check CUDA availability
+    if torch.cuda.is_available():
+        print_debug(f"CUDA available: {torch.cuda.get_device_name()}")
+        print_debug(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
     else:
-        if not Path(args.model_path).exists():
-            print(f"[ERROR] Model path does not exist: {args.model_path}")
-            sys.exit(1)
-        models_to_test = [args.model_path]
+        print_debug("CUDA not available, using CPU")
     
-    print(f"[DEBUG] Will test {len(models_to_test)} model(s)")
-    
-    # Perform inference on all models
-    all_results = []
-    
-    print(f"\n[DEBUG] ========== STARTING INFERENCE PROCESS ==========")
-    
-    for i, model_path in enumerate(models_to_test, 1):
-        model_name = Path(model_path).name
-        print(f"\n[DEBUG] ========== MODEL {i}/{len(models_to_test)}: {model_name} ==========")
+    try:
+        # Load model and processor
+        print_debug("\n" + "="*50)
+        print_debug("LOADING MODEL")
+        print_debug("="*50)
         
-        result = perform_ocr_inference(model_path, args.image_path, args.task)
-        result['model_name'] = model_name
-        all_results.append(result)
+        model, processor = load_model_and_processor(args.model_path, args.is_quantized)
+        
+        # Perform inference
+        print_debug("\n" + "="*50)
+        print_debug("PERFORMING INFERENCE")
+        print_debug("="*50)
+        
+        result = perform_ocr_inference(model, processor, args.image_path, args.task_type)
+        
+        # Save results
+        print_debug("\n" + "="*50)
+        print_debug("SAVING RESULTS")
+        print_debug("="*50)
+        
+        output_data = {
+            'model_path': args.model_path,
+            'image_path': args.image_path,
+            'task_type': args.task_type,
+            'is_quantized': args.is_quantized,
+            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+            'result': result
+        }
+        
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+        
+        with open(args.output_file, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, indent=2, ensure_ascii=False)
+        
+        print_debug(f"Results saved to: {args.output_file}")
+        
+        # Print summary
+        print_debug("\n" + "="*50)
+        print_debug("INFERENCE SUMMARY")
+        print_debug("="*50)
         
         if result['success']:
-            print(f"[DEBUG] ✅ {model_name} inference completed successfully")
-            print(f"[DEBUG] - Total time: {result['timing']['total_time_seconds']:.2f}s")
-            print(f"[DEBUG] - Generation time: {result['timing']['generation_time_seconds']:.2f}s")
-            print(f"[DEBUG] - Text length: {result['text_length']} characters")
+            print_debug("✅ Inference successful")
+            print_debug(f"Inference time: {result['inference_time']:.2f}s")
+            print_debug(f"RAM usage: {result['ram_usage']:.1f}MB")
+            print_debug(f"GPU usage: {result['gpu_usage']:.1f}MB")
+            print_debug(f"Generated text length: {len(result['generated_text']) if result['generated_text'] else 0} characters")
+            if result['generated_text']:
+                preview = result['generated_text'][:200]
+                if len(result['generated_text']) > 200:
+                    preview += "..."
+                print_debug(f"Text preview: {preview}")
         else:
-            print(f"[DEBUG] ❌ {model_name} inference failed: {result['error']}")
+            print_debug("❌ Inference failed")
+            print_debug(f"Error: {result['error']}")
+            return 1
+        
+        return 0
+        
+    except Exception as e:
+        print_debug(f"Fatal error: {str(e)}", "ERROR")
+        import traceback
+        print_debug(f"Traceback: {traceback.format_exc()}", "ERROR")
+        return 1
     
-    # Save results to file
-    results_file = Path(args.output_file)
-    print(f"\n[DEBUG] Saving results to {results_file}")
-    
-    final_results = {
-        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'image_path': args.image_path,
-        'task': args.task,
-        'models_tested': len(models_to_test),
-        'successful_inferences': len([r for r in all_results if r['success']]),
-        'failed_inferences': len([r for r in all_results if not r['success']]),
-        'results': all_results,
-        'system_info': {
-            'cuda_available': torch.cuda.is_available(),
-            'gpu_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
-            'pytorch_version': torch.__version__,
-            'python_version': sys.version
-        }
-    }
-    
-    with open(results_file, 'w') as f:
-        json.dump(final_results, f, indent=2, default=str)
-    
-    print(f"[DEBUG] Results saved to {results_file}")
-    
-    # Print summary
-    print(f"\n[DEBUG] ========== INFERENCE SUMMARY ==========")
-    successful = [r for r in all_results if r['success']]
-    failed = [r for r in all_results if not r['success']]
-    
-    print(f"[DEBUG] Total models tested: {len(all_results)}")
-    print(f"[DEBUG] Successful: {len(successful)}")
-    print(f"[DEBUG] Failed: {len(failed)}")
-    
-    if successful:
-        print(f"\n[DEBUG] Successful inferences:")
-        for result in successful:
-            print(f"[DEBUG] - {result['model_name']}: {result['text_length']} chars in {result['timing']['total_time_seconds']:.1f}s")
-    
-    if failed:
-        print(f"\n[DEBUG] Failed inferences:")
-        for result in failed:
-            print(f"[DEBUG] - {result['model_name']}: {result['error']}")
-    
-    print(f"\n[DEBUG] Inference script completed at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    finally:
+        # Cleanup
+        if 'model' in locals():
+            del model
+        if 'processor' in locals():
+            del processor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
