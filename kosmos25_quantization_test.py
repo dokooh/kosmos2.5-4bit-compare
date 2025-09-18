@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-Kosmos-2.5 4-bit Quantization Testing Script
-
-This script tests multiple 4-bit quantization strategies for the Hugging Face Kosmos-2.5 model,
-evaluating OCR/Markdown tasks on locally provided images while monitoring memory usage.
+Kosmos 2.5 4-bit Quantization Testing Script
+Tests various 4-bit quantization strategies on Kosmos 2.5 model for OCR/Markdown tasks
 """
 
 import argparse
@@ -12,490 +10,541 @@ import logging
 import os
 import sys
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Optional, Tuple
 
 import psutil
 import torch
 from PIL import Image
 from transformers import (
-    AutoProcessor, 
+    AutoImageProcessor, 
+    AutoTokenizer, 
     Kosmos2_5ForConditionalGeneration,
     BitsAndBytesConfig
 )
 import gc
 
-try:
-    import GPUtil
-    GPUTIL_AVAILABLE = True
-except ImportError:
-    GPUTIL_AVAILABLE = False
-    print("Warning: GPUtil not available. GPU memory monitoring will be limited.")
-
-try:
-    import pynvml
-    pynvml.nvmlInit()
-    PYNVML_AVAILABLE = True
-except (ImportError, Exception):
-    PYNVML_AVAILABLE = False
-    print("Warning: pynvml not available. Advanced GPU monitoring will be limited.")
-
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('kosmos2_5_quantization_debug.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 class MemoryMonitor:
-    """Monitor GPU and RAM memory usage."""
+    """Monitor GPU and RAM memory usage"""
     
     def __init__(self):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-    def get_gpu_memory(self) -> Dict[str, float]:
-        """Get GPU memory usage in MB."""
-        if not torch.cuda.is_available():
-            return {"allocated": 0, "cached": 0, "total": 0, "free": 0}
-        
-        allocated = torch.cuda.memory_allocated() / 1024**2
-        cached = torch.cuda.memory_reserved() / 1024**2
-        
-        gpu_info = {"allocated": allocated, "cached": cached, "total": 0, "free": 0}
-        
-        if GPUTIL_AVAILABLE:
-            try:
-                gpus = GPUtil.getGPUs()
-                if gpus:
-                    gpu = gpus[0]
-                    gpu_info["total"] = gpu.memoryTotal
-                    gpu_info["free"] = gpu.memoryFree
-            except Exception as e:
-                logging.warning(f"Error getting GPU info with GPUtil: {e}")
-        
-        return gpu_info
+        logger.debug("Initializing MemoryMonitor")
+        self.gpu_available = torch.cuda.is_available()
+        logger.debug(f"GPU available: {self.gpu_available}")
+        if self.gpu_available:
+            logger.debug(f"CUDA device count: {torch.cuda.device_count()}")
+            for i in range(torch.cuda.device_count()):
+                logger.debug(f"GPU {i}: {torch.cuda.get_device_name(i)}")
     
-    def get_ram_usage(self) -> Dict[str, float]:
-        """Get RAM usage in MB."""
-        memory = psutil.virtual_memory()
-        return {
-            "total": memory.total / 1024**2,
-            "available": memory.available / 1024**2,
-            "used": memory.used / 1024**2,
-            "percent": memory.percent
+    def get_memory_stats(self) -> Dict:
+        """Get current memory statistics"""
+        logger.debug("Getting memory statistics")
+        
+        # RAM usage
+        ram = psutil.virtual_memory()
+        ram_stats = {
+            'ram_total_gb': round(ram.total / (1024**3), 2),
+            'ram_used_gb': round(ram.used / (1024**3), 2),
+            'ram_available_gb': round(ram.available / (1024**3), 2),
+            'ram_percent': ram.percent
         }
-    
-    def clear_cache(self):
-        """Clear GPU cache and run garbage collection."""
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+        
+        # GPU usage
+        gpu_stats = {}
+        if self.gpu_available:
+            try:
+                for i in range(torch.cuda.device_count()):
+                    allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                    reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                    gpu_stats[f'gpu_{i}_allocated_gb'] = round(allocated, 2)
+                    gpu_stats[f'gpu_{i}_reserved_gb'] = round(reserved, 2)
+                    
+                    # Get total memory
+                    total_memory = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                    gpu_stats[f'gpu_{i}_total_gb'] = round(total_memory, 2)
+                    gpu_stats[f'gpu_{i}_percent'] = round((allocated / total_memory) * 100, 2)
+                    
+                    logger.debug(f"GPU {i} - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB, Total: {total_memory:.2f}GB")
+            except Exception as e:
+                logger.error(f"Error getting GPU memory stats: {e}")
+                gpu_stats['gpu_error'] = str(e)
+        
+        logger.debug(f"RAM stats: {ram_stats}")
+        logger.debug(f"GPU stats: {gpu_stats}")
+        
+        return {**ram_stats, **gpu_stats}
 
-
-class QuantizationTester:
-    """Test different quantization strategies for Kosmos-2.5."""
+class Kosmos25QuantizationTester:
+    """Test different 4-bit quantization strategies for Kosmos 2.5"""
     
     def __init__(self, model_name: str = "microsoft/kosmos-2.5"):
+        logger.debug(f"Initializing Kosmos25QuantizationTester with model: {model_name}")
         self.model_name = model_name
-        self.monitor = MemoryMonitor()
-        self.processor = None
+        self.memory_monitor = MemoryMonitor()
         self.results = []
         
-        # Setup logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s'
-        )
-        self.logger = logging.getLogger(__name__)
-    
-    def load_processor(self):
-        """Load the processor once to reuse across tests."""
-        if self.processor is None:
-            self.logger.info("Loading processor...")
-            self.processor = AutoProcessor.from_pretrained(self.model_name)
-    
-    def get_quantization_configs(self) -> Dict[str, Optional[BitsAndBytesConfig]]:
-        """Define different quantization configurations to test."""
-        configs = {
-            "baseline": None,  # No quantization
-            "nf4_fp16": BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True
-            ),
-            "nf4_bf16": BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_use_double_quant=True
-            ),
-            "fp4_fp16": BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="fp4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True
-            ),
-            "fp4_bf16": BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="fp4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_use_double_quant=True
-            ),
-            "nf4_fp16_single": BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=False
-            )
+        # Define quantization strategies
+        self.quantization_strategies = {
+            'nf4': {
+                'load_in_4bit': True,
+                'bnb_4bit_quant_type': 'nf4',
+                'bnb_4bit_compute_dtype': torch.float16,
+                'bnb_4bit_use_double_quant': True
+            },
+            'fp4': {
+                'load_in_4bit': True,
+                'bnb_4bit_quant_type': 'fp4',
+                'bnb_4bit_compute_dtype': torch.float16,
+                'bnb_4bit_use_double_quant': True
+            },
+            'nf4_no_double_quant': {
+                'load_in_4bit': True,
+                'bnb_4bit_quant_type': 'nf4',
+                'bnb_4bit_compute_dtype': torch.float16,
+                'bnb_4bit_use_double_quant': False
+            },
+            'fp4_no_double_quant': {
+                'load_in_4bit': True,
+                'bnb_4bit_quant_type': 'fp4',
+                'bnb_4bit_compute_dtype': torch.float16,
+                'bnb_4bit_use_double_quant': False
+            }
         }
-        return configs
-    
-    def load_model(self, config_name: str, quantization_config: Optional[BitsAndBytesConfig]) -> tuple:
-        """Load model with specified quantization configuration."""
-        self.logger.info(f"Loading model with {config_name} configuration...")
         
-        start_time = time.time()
+        logger.debug(f"Defined {len(self.quantization_strategies)} quantization strategies")
+        for name, config in self.quantization_strategies.items():
+            logger.debug(f"Strategy '{name}': {config}")
+    
+    def cleanup_model(self):
+        """Clean up model and free memory"""
+        logger.debug("Starting model cleanup")
+        
+        if hasattr(self, 'model') and self.model is not None:
+            logger.debug("Deleting model")
+            del self.model
+            self.model = None
+        
+        if hasattr(self, 'processor') and self.processor is not None:
+            logger.debug("Deleting processor")
+            del self.processor
+            self.processor = None
+            
+        if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+            logger.debug("Deleting tokenizer")
+            del self.tokenizer
+            self.tokenizer = None
+        
+        # Force garbage collection
+        logger.debug("Running garbage collection")
+        gc.collect()
+        
+        # Clear GPU cache
+        if torch.cuda.is_available():
+            logger.debug("Clearing GPU cache")
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        logger.debug("Model cleanup completed")
+    
+    def load_model_with_quantization(self, strategy_name: str, config: Dict) -> Tuple[bool, str, Dict]:
+        """Load model with specific quantization configuration"""
+        logger.debug(f"Loading model with quantization strategy: {strategy_name}")
+        logger.debug(f"Quantization config: {config}")
         
         try:
-            if quantization_config is None:
-                # Baseline model without quantization
-                model = Kosmos2_5ForConditionalGeneration.from_pretrained(
-                    self.model_name,
-                    torch_dtype=torch.float16,
-                    device_map="auto"
-                )
-            else:
-                # Quantized model
-                model = Kosmos2_5ForConditionalGeneration.from_pretrained(
-                    self.model_name,
-                    quantization_config=quantization_config,
-                    device_map="auto"
-                )
+            # Get memory before loading
+            memory_before = self.memory_monitor.get_memory_stats()
+            logger.debug(f"Memory before loading: {memory_before}")
             
-            load_time = time.time() - start_time
-            
-            # Get memory usage after loading
-            gpu_memory = self.monitor.get_gpu_memory()
-            ram_usage = self.monitor.get_ram_usage()
-            
-            self.logger.info(f"Model loaded in {load_time:.2f}s")
-            self.logger.info(f"GPU Memory - Allocated: {gpu_memory['allocated']:.1f}MB, Cached: {gpu_memory['cached']:.1f}MB")
-            
-            return model, load_time, gpu_memory, ram_usage
-            
-        except Exception as e:
-            self.logger.error(f"Error loading model with {config_name}: {str(e)}")
-            return None, 0, {}, {}
-    
-    def test_ocr_task(self, model, image_path: str) -> Dict[str, Any]:
-        """Test OCR/Markdown generation on the provided image."""
-        try:
-            # Load and process image
-            image = Image.open(image_path)
-            
-            # Prepare inputs
-            prompt = "<ocr>"  # OCR task prompt for Kosmos-2.5
-            inputs = self.processor(text=prompt, images=image, return_tensors="pt")
-            
-            # Move inputs to the same device as model
-            if hasattr(model, 'device'):
-                device = model.device
-            else:
-                device = next(model.parameters()).device
-            
-            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-            
-            # Measure inference time
             start_time = time.time()
             
+            # Create quantization config
+            logger.debug("Creating BitsAndBytesConfig")
+            quantization_config = BitsAndBytesConfig(**config)
+            
+            # Load processor
+            logger.debug("Loading image processor")
+            self.processor = AutoImageProcessor.from_pretrained(self.model_name)
+            
+            # Load tokenizer
+            logger.debug("Loading tokenizer")
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            
+            # Load model with quantization
+            logger.debug("Loading quantized model")
+            self.model = Kosmos2_5ForConditionalGeneration.from_pretrained(
+                self.model_name,
+                quantization_config=quantization_config,
+                device_map="auto",
+                torch_dtype=torch.float16
+            )
+            
+            load_time = time.time() - start_time
+            logger.debug(f"Model loading completed in {load_time:.2f} seconds")
+            
+            # Get memory after loading
+            memory_after = self.memory_monitor.get_memory_stats()
+            logger.debug(f"Memory after loading: {memory_after}")
+            
+            # Calculate memory usage
+            memory_usage = {}
+            for key in memory_before:
+                if key in memory_after:
+                    if 'gb' in key and key != 'ram_total_gb':
+                        memory_usage[f"{key}_diff"] = round(memory_after[key] - memory_before[key], 2)
+            
+            logger.debug(f"Memory usage difference: {memory_usage}")
+            
+            return True, "Success", {
+                'load_time_seconds': round(load_time, 2),
+                'memory_before': memory_before,
+                'memory_after': memory_after,
+                'memory_usage': memory_usage
+            }
+            
+        except Exception as e:
+            error_msg = f"Error loading model with {strategy_name}: {str(e)}"
+            logger.error(error_msg)
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return False, error_msg, {}
+    
+    def test_ocr_inference(self, image_path: str) -> Tuple[bool, str, Dict]:
+        """Test OCR/Markdown inference on the loaded model"""
+        logger.debug(f"Testing OCR inference with image: {image_path}")
+        
+        try:
+            # Load and validate image
+            logger.debug("Loading image")
+            if not os.path.exists(image_path):
+                raise FileNotFoundError(f"Image file not found: {image_path}")
+            
+            image = Image.open(image_path)
+            logger.debug(f"Image loaded: {image.size}, mode: {image.mode}")
+            
+            # Convert to RGB if necessary
+            if image.mode != 'RGB':
+                logger.debug(f"Converting image from {image.mode} to RGB")
+                image = image.convert('RGB')
+            
+            # Get memory before inference
+            memory_before = self.memory_monitor.get_memory_stats()
+            logger.debug(f"Memory before inference: {memory_before}")
+            
+            start_time = time.time()
+            
+            # Prepare inputs
+            logger.debug("Processing image inputs")
+            inputs = self.processor(images=image, return_tensors="pt")
+            
+            # Move to GPU if available
+            device = next(self.model.parameters()).device
+            logger.debug(f"Model device: {device}")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            
+            # Generate OCR output
+            logger.debug("Starting model inference")
             with torch.no_grad():
-                generated_ids = model.generate(
+                generated_ids = self.model.generate(
                     **inputs,
                     max_new_tokens=512,
                     do_sample=False,
-                    pad_token_id=self.processor.tokenizer.eos_token_id
+                    num_beams=1,
+                    pad_token_id=self.tokenizer.eos_token_id
                 )
             
-            inference_time = time.time() - start_time
-            
             # Decode output
-            generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            logger.debug("Decoding generated tokens")
+            generated_text = self.tokenizer.batch_decode(
+                generated_ids, 
+                skip_special_tokens=True
+            )[0]
             
-            # Extract the generated content (remove the prompt)
-            if prompt in generated_text:
-                result_text = generated_text.replace(prompt, "").strip()
-            else:
-                result_text = generated_text.strip()
+            inference_time = time.time() - start_time
+            logger.debug(f"Inference completed in {inference_time:.2f} seconds")
             
-            return {
-                "success": True,
-                "inference_time": inference_time,
-                "generated_text": result_text,
-                "text_length": len(result_text),
-                "error": None
+            # Get memory after inference
+            memory_after = self.memory_monitor.get_memory_stats()
+            logger.debug(f"Memory after inference: {memory_after}")
+            
+            # Calculate memory usage during inference
+            memory_usage = {}
+            for key in memory_before:
+                if key in memory_after:
+                    if 'gb' in key and key != 'ram_total_gb':
+                        memory_usage[f"{key}_diff"] = round(memory_after[key] - memory_before[key], 2)
+            
+            logger.debug(f"Generated text length: {len(generated_text)} characters")
+            logger.debug(f"Generated text preview: {generated_text[:200]}...")
+            
+            return True, "Success", {
+                'inference_time_seconds': round(inference_time, 2),
+                'generated_text': generated_text,
+                'generated_text_length': len(generated_text),
+                'memory_before_inference': memory_before,
+                'memory_after_inference': memory_after,
+                'memory_usage_inference': memory_usage
             }
             
         except Exception as e:
-            self.logger.error(f"Error during OCR task: {str(e)}")
-            return {
-                "success": False,
-                "inference_time": 0,
-                "generated_text": "",
-                "text_length": 0,
-                "error": str(e)
-            }
+            error_msg = f"Error during OCR inference: {str(e)}"
+            logger.error(error_msg)
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return False, error_msg, {}
     
-    def run_test(self, config_name: str, quantization_config: Optional[BitsAndBytesConfig], 
-                image_path: str) -> Dict[str, Any]:
-        """Run a complete test for one quantization configuration."""
-        self.logger.info(f"\n{'='*50}")
-        self.logger.info(f"Testing configuration: {config_name}")
-        self.logger.info(f"{'='*50}")
+    def test_strategy(self, strategy_name: str, image_path: str) -> Dict:
+        """Test a single quantization strategy"""
+        logger.info(f"Starting test for strategy: {strategy_name}")
         
-        # Clear memory before loading
-        self.monitor.clear_cache()
-        
-        # Record initial memory state
-        initial_gpu = self.monitor.get_gpu_memory()
-        initial_ram = self.monitor.get_ram_usage()
-        
-        # Load model
-        model, load_time, post_load_gpu, post_load_ram = self.load_model(config_name, quantization_config)
-        
-        if model is None:
-            return {
-                "config_name": config_name,
-                "success": False,
-                "error": "Failed to load model",
-                "load_time": 0,
-                "inference_time": 0,
-                "memory_usage": {}
-            }
-        
-        # Test OCR task
-        ocr_results = self.test_ocr_task(model, image_path)
-        
-        # Get final memory usage
-        final_gpu = self.monitor.get_gpu_memory()
-        final_ram = self.monitor.get_ram_usage()
-        
-        # Calculate model size (approximate)
-        model_size_mb = sum(p.numel() * p.element_size() for p in model.parameters()) / (1024**2)
-        
-        # Compile results
         result = {
-            "config_name": config_name,
-            "success": ocr_results["success"],
-            "timestamp": datetime.now().isoformat(),
-            "model_size_mb": model_size_mb,
-            "load_time": load_time,
-            "inference_time": ocr_results["inference_time"],
-            "generated_text_length": ocr_results["text_length"],
-            "generated_text": ocr_results["generated_text"][:500] + "..." if len(ocr_results["generated_text"]) > 500 else ocr_results["generated_text"],
-            "error": ocr_results["error"],
-            "memory_usage": {
-                "initial_gpu": initial_gpu,
-                "post_load_gpu": post_load_gpu,
-                "final_gpu": final_gpu,
-                "initial_ram": initial_ram,
-                "post_load_ram": post_load_ram,
-                "final_ram": final_ram,
-                "gpu_memory_increase": post_load_gpu["allocated"] - initial_gpu["allocated"],
-                "ram_memory_increase": post_load_ram["used"] - initial_ram["used"]
-            }
+            'strategy_name': strategy_name,
+            'timestamp': datetime.now().isoformat(),
+            'success': False,
+            'error_message': None,
+            'model_loading': {},
+            'ocr_inference': {}
         }
         
-        # Cleanup
-        del model
-        self.monitor.clear_cache()
+        try:
+            # Clean up any previous model
+            self.cleanup_model()
+            
+            # Load model with quantization
+            logger.debug(f"Step 1: Loading model with {strategy_name} quantization")
+            success, message, loading_stats = self.load_model_with_quantization(
+                strategy_name, 
+                self.quantization_strategies[strategy_name]
+            )
+            
+            result['model_loading'] = {
+                'success': success,
+                'message': message,
+                **loading_stats
+            }
+            
+            if not success:
+                result['error_message'] = f"Model loading failed: {message}"
+                logger.error(f"Strategy {strategy_name} failed at model loading: {message}")
+                return result
+            
+            logger.info(f"Model loaded successfully for {strategy_name}")
+            
+            # Test OCR inference
+            logger.debug(f"Step 2: Testing OCR inference for {strategy_name}")
+            success, message, inference_stats = self.test_ocr_inference(image_path)
+            
+            result['ocr_inference'] = {
+                'success': success,
+                'message': message,
+                **inference_stats
+            }
+            
+            if not success:
+                result['error_message'] = f"OCR inference failed: {message}"
+                logger.error(f"Strategy {strategy_name} failed at OCR inference: {message}")
+                return result
+            
+            logger.info(f"OCR inference completed successfully for {strategy_name}")
+            result['success'] = True
+            
+        except Exception as e:
+            error_msg = f"Unexpected error testing {strategy_name}: {str(e)}"
+            logger.error(error_msg)
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            result['error_message'] = error_msg
         
-        self.logger.info(f"Test completed for {config_name}")
-        if ocr_results["success"]:
-            self.logger.info(f"Inference time: {ocr_results['inference_time']:.2f}s")
-            self.logger.info(f"Generated text length: {ocr_results['text_length']} characters")
+        finally:
+            # Always clean up after each test
+            logger.debug(f"Cleaning up after {strategy_name} test")
+            self.cleanup_model()
         
+        logger.info(f"Completed test for strategy: {strategy_name}, Success: {result['success']}")
         return result
     
-    def run_all_tests(self, image_path: str) -> List[Dict[str, Any]]:
-        """Run tests for all quantization configurations."""
-        self.logger.info("Starting comprehensive quantization tests...")
-        
-        # Load processor once
-        self.load_processor()
-        
-        # Get all configurations
-        configs = self.get_quantization_configs()
+    def run_all_tests(self, image_path: str) -> List[Dict]:
+        """Run tests for all quantization strategies"""
+        logger.info("Starting comprehensive quantization testing")
+        logger.info(f"Image path: {image_path}")
+        logger.info(f"Model: {self.model_name}")
+        logger.info(f"Strategies to test: {list(self.quantization_strategies.keys())}")
         
         results = []
-        for config_name, quantization_config in configs.items():
-            try:
-                result = self.run_test(config_name, quantization_config, image_path)
-                results.append(result)
-                
-                # Add small delay between tests
-                time.sleep(2)
-                
-            except Exception as e:
-                self.logger.error(f"Critical error testing {config_name}: {str(e)}")
-                results.append({
-                    "config_name": config_name,
-                    "success": False,
-                    "error": f"Critical error: {str(e)}",
-                    "timestamp": datetime.now().isoformat()
-                })
         
+        for strategy_name in self.quantization_strategies.keys():
+            logger.info(f"Testing strategy {len(results) + 1}/{len(self.quantization_strategies)}: {strategy_name}")
+            
+            result = self.test_strategy(strategy_name, image_path)
+            results.append(result)
+            
+            # Log summary for this strategy
+            if result['success']:
+                load_time = result['model_loading'].get('load_time_seconds', 'N/A')
+                inference_time = result['ocr_inference'].get('inference_time_seconds', 'N/A')
+                logger.info(f"Strategy {strategy_name} - Load: {load_time}s, Inference: {inference_time}s")
+            else:
+                logger.warning(f"Strategy {strategy_name} failed: {result['error_message']}")
+        
+        logger.info("All quantization tests completed")
         return results
     
-    def save_results(self, results: List[Dict[str, Any]], output_path: str):
-        """Save test results to file."""
+    def save_results(self, results: List[Dict], output_path: str):
+        """Save test results to JSON file"""
+        logger.debug(f"Saving results to: {output_path}")
+        
         try:
-            # Prepare summary data
-            summary = {
-                "test_metadata": {
-                    "timestamp": datetime.now().isoformat(),
-                    "model_name": self.model_name,
-                    "total_configurations": len(results),
-                    "successful_tests": sum(1 for r in results if r.get("success", False)),
-                    "cuda_available": torch.cuda.is_available(),
-                    "device_name": torch.cuda.get_device_name() if torch.cuda.is_available() else "CPU"
+            # Add metadata
+            final_results = {
+                'metadata': {
+                    'test_timestamp': datetime.now().isoformat(),
+                    'model_name': self.model_name,
+                    'total_strategies_tested': len(results),
+                    'successful_strategies': sum(1 for r in results if r['success']),
+                    'python_version': sys.version,
+                    'torch_version': torch.__version__,
+                    'cuda_available': torch.cuda.is_available(),
+                    'cuda_version': torch.version.cuda if torch.cuda.is_available() else None
                 },
-                "results": results,
-                "performance_comparison": self._generate_performance_comparison(results)
+                'results': results
             }
             
-            # Save to JSON file
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(summary, f, indent=2, ensure_ascii=False)
+            # Create output directory if it doesn't exist
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
             
-            self.logger.info(f"Results saved to {output_path}")
+            # Save to JSON
+            with open(output_path, 'w') as f:
+                json.dump(final_results, f, indent=2, ensure_ascii=False)
             
-            # Print summary to console
-            self._print_summary(results)
+            logger.info(f"Results saved to: {output_path}")
+            
+            # Print summary
+            self.print_summary(results)
             
         except Exception as e:
-            self.logger.error(f"Error saving results: {str(e)}")
+            logger.error(f"Error saving results: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
     
-    def _generate_performance_comparison(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Generate performance comparison metrics."""
-        successful_results = [r for r in results if r.get("success", False)]
+    def print_summary(self, results: List[Dict]):
+        """Print a summary of test results"""
+        logger.info("\n" + "="*60)
+        logger.info("QUANTIZATION TEST SUMMARY")
+        logger.info("="*60)
         
-        if not successful_results:
-            return {"error": "No successful tests to compare"}
-        
-        comparison = {
-            "fastest_inference": min(successful_results, key=lambda x: x["inference_time"]),
-            "slowest_inference": max(successful_results, key=lambda x: x["inference_time"]),
-            "lowest_memory": min(successful_results, key=lambda x: x["memory_usage"]["gpu_memory_increase"]),
-            "highest_memory": max(successful_results, key=lambda x: x["memory_usage"]["gpu_memory_increase"]),
-            "smallest_model": min(successful_results, key=lambda x: x["model_size_mb"]),
-            "largest_model": max(successful_results, key=lambda x: x["model_size_mb"])
-        }
-        
-        return comparison
-    
-    def _print_summary(self, results: List[Dict[str, Any]]):
-        """Print a summary of test results to console."""
-        print(f"\n{'='*60}")
-        print("KOSMOS-2.5 QUANTIZATION TEST SUMMARY")
-        print(f"{'='*60}")
-        
-        successful_results = [r for r in results if r.get("success", False)]
-        
-        print(f"Total configurations tested: {len(results)}")
-        print(f"Successful tests: {len(successful_results)}")
-        print(f"Failed tests: {len(results) - len(successful_results)}")
-        
-        if successful_results:
-            print(f"\n{'Configuration':<20} {'Load Time':<12} {'Inference':<12} {'GPU Mem':<12} {'Model Size':<12}")
-            print(f"{'Name':<20} {'(seconds)':<12} {'(seconds)':<12} {'(MB)':<12} {'(MB)':<12}")
-            print("-" * 68)
+        for result in results:
+            strategy = result['strategy_name']
+            success = result['success']
             
-            for result in successful_results:
-                print(f"{result['config_name']:<20} "
-                      f"{result['load_time']:<12.2f} "
-                      f"{result['inference_time']:<12.2f} "
-                      f"{result['memory_usage']['gpu_memory_increase']:<12.1f} "
-                      f"{result['model_size_mb']:<12.1f}")
+            if success:
+                load_time = result['model_loading'].get('load_time_seconds', 'N/A')
+                inference_time = result['ocr_inference'].get('inference_time_seconds', 'N/A')
+                
+                # Memory usage
+                loading_memory = result['model_loading'].get('memory_usage', {})
+                gpu_usage = [f"{k}: {v}GB" for k, v in loading_memory.items() if 'gpu' in k and 'diff' in k and v > 0]
+                ram_usage = [f"{k}: {v}GB" for k, v in loading_memory.items() if 'ram' in k and 'diff' in k and v > 0]
+                
+                logger.info(f"\n✓ {strategy}:")
+                logger.info(f"  Load Time: {load_time}s")
+                logger.info(f"  Inference Time: {inference_time}s")
+                if gpu_usage:
+                    logger.info(f"  GPU Usage: {', '.join(gpu_usage)}")
+                if ram_usage:
+                    logger.info(f"  RAM Usage: {', '.join(ram_usage)}")
+            else:
+                logger.info(f"\n✗ {strategy}: FAILED")
+                logger.info(f"  Error: {result['error_message']}")
         
-        print(f"\n{'='*60}")
-
+        logger.info("\n" + "="*60)
 
 def main():
-    """Main function to run the quantization tests."""
+    """Main function with argument parsing"""
     parser = argparse.ArgumentParser(
-        description="Test 4-bit quantization strategies for Kosmos-2.5 model",
+        description="Test Kosmos 2.5 4-bit quantization strategies",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python kosmos_quantization_test.py -i image.jpg -o results.json
-  python kosmos_quantization_test.py --input /path/to/image.png --output /path/to/results.json
-  python kosmos_quantization_test.py -i image.jpg -o results.json --model microsoft/kosmos-2.5
+  python kosmos2_5_quantization_test.py test_image.jpg results.json
+  python kosmos2_5_quantization_test.py /path/to/image.png /path/to/output.json
+  python kosmos2_5_quantization_test.py image.jpg results.json --model microsoft/kosmos-2.5
         """
     )
     
     parser.add_argument(
-        "-i", "--input",
-        required=True,
-        help="Path to input image file for OCR testing"
+        'input_image',
+        help='Path to input image for OCR testing'
     )
     
     parser.add_argument(
-        "-o", "--output",
-        required=True,
-        help="Path to output JSON file for saving results"
+        'output_file',
+        help='Path to output JSON file for results'
     )
     
     parser.add_argument(
-        "--model",
-        default="microsoft/kosmos-2.5",
-        help="Model name or path (default: microsoft/kosmos-2.5)"
+        '--model',
+        default='microsoft/kosmos-2.5',
+        help='Hugging Face model name (default: microsoft/kosmos-2.5)'
     )
     
     parser.add_argument(
-        "--device",
-        default="auto",
-        help="Device to use (auto, cuda, cpu) (default: auto)"
+        '--verbose',
+        action='store_true',
+        help='Enable verbose debug output'
     )
     
     args = parser.parse_args()
     
-    # Validate input file
-    if not os.path.exists(args.input):
-        print(f"Error: Input image file '{args.input}' does not exist.")
-        sys.exit(1)
-    
-    # Validate input is an image file
-    try:
-        with Image.open(args.input) as img:
-            img.verify()
-    except Exception as e:
-        print(f"Error: '{args.input}' is not a valid image file: {str(e)}")
-        sys.exit(1)
-    
-    # Create output directory if it doesn't exist
-    output_dir = os.path.dirname(args.output)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    
-    # Check CUDA availability
-    if torch.cuda.is_available():
-        print(f"CUDA is available. Using GPU: {torch.cuda.get_device_name()}")
+    # Set logging level
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
     else:
-        print("CUDA is not available. Using CPU (this will be slow).")
+        logging.getLogger().setLevel(logging.INFO)
     
-    # Initialize tester and run tests
-    tester = QuantizationTester(model_name=args.model)
+    logger.info("Starting Kosmos 2.5 quantization testing script")
+    logger.info(f"Input image: {args.input_image}")
+    logger.info(f"Output file: {args.output_file}")
+    logger.info(f"Model: {args.model}")
+    
+    # Validate input image
+    if not os.path.exists(args.input_image):
+        logger.error(f"Input image not found: {args.input_image}")
+        sys.exit(1)
+    
+    # Validate output directory
+    output_dir = os.path.dirname(os.path.abspath(args.output_file))
+    if not os.path.exists(output_dir):
+        logger.info(f"Creating output directory: {output_dir}")
+        os.makedirs(output_dir, exist_ok=True)
     
     try:
-        results = tester.run_all_tests(args.input)
-        tester.save_results(results, args.output)
+        # Initialize tester
+        logger.debug("Initializing quantization tester")
+        tester = Kosmos25QuantizationTester(args.model)
         
-        print(f"\nTesting completed successfully!")
-        print(f"Results saved to: {args.output}")
+        # Run all tests
+        logger.info("Starting quantization tests")
+        results = tester.run_all_tests(args.input_image)
         
-    except KeyboardInterrupt:
-        print("\nTesting interrupted by user.")
-        sys.exit(1)
+        # Save results
+        logger.info("Saving results")
+        tester.save_results(results, args.output_file)
+        
+        logger.info("Script completed successfully!")
+        
     except Exception as e:
-        print(f"Error during testing: {str(e)}")
+        logger.error(f"Script failed with error: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
